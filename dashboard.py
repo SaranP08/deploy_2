@@ -7,7 +7,7 @@ import os
 import tempfile
 import zipfile
 import glob
-from detector import detect_damage
+from detector import detect_damage, estimate_position_cm
 
 # === Page Setup ===
 st.set_page_config(page_title="🧠 Fabric Defect Dashboard", layout="wide")
@@ -41,19 +41,50 @@ with tab1:
     elif input_mode == "Video":
         video_file = st.file_uploader("Upload a video", type=["mp4", "mov", "avi"])
         if video_file:
-            tfile = tempfile.NamedTemporaryFile(delete=False)
+            tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
             tfile.write(video_file.read())
             cap = cv2.VideoCapture(tfile.name)
+
+            # Get video properties
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            fps = int(cap.get(cv2.CAP_PROP_FPS))
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+            # Output path for annotated video
+            output_path = os.path.join(tempfile.gettempdir(), "annotated_output.mp4")
+            out_fps = 10  # Slow down the video to 10 FPS
+            out = cv2.VideoWriter(output_path, fourcc, out_fps, (width, height))
+
             stframe = st.empty()
-            frames = []
+            all_results = []
+            frame_index = 0
+
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
                     break
-                stframe.image(frame[:, :, ::-1], channels="RGB")
-                frames.append((frame.copy(), f"video_frame_{len(frames)}"))
+
+                annotated, results = detect_damage(frame)
+
+                # Add positional estimates to the results
+                for r in results:
+                    position_cm = estimate_position_cm(r["center"], frame_index=frame_index, fps=fps)
+                    r["position_cm"] = position_cm
+
+                out.write(annotated)  # Write the annotated frame
+
+                for r in results:
+                    r["source"] = f"video_frame_{frame_index}"
+                all_results.extend(results)
+                frame_index += 1
+
             cap.release()
-            st.session_state.inputs = frames
+            out.release()
+
+            st.success("✅ Video processed.")
+            st.session_state.inputs = [("video", output_path)]  # Store video path for playback
+            st.session_state.results = all_results
 
     elif input_mode == "Webcam":
         st.warning("📸 Webcam preview in Streamlit is experimental. Capture not supported here.")
@@ -84,22 +115,33 @@ with tab2:
     if not st.session_state.inputs:
         st.warning("⚠️ No input images found. Upload from the Input tab.")
     else:
-        all_results = []
-        for image, name in st.session_state.inputs:
-            st.subheader(f"🖼️ {name}")
-            annotated, results = detect_damage(image)
-            st.image(annotated[:, :, ::-1], caption="Detected Image", use_column_width=True)
+        if st.session_state.inputs[0][0] == "video":
+            st.subheader("🎞️ Annotated Video Output")
+            # Ensure we pass the correct path for video playback
+            st.video(st.session_state.inputs[0][1])  # The video file path for the annotated video
+        else:
+            all_results = []
+            for image, name in st.session_state.inputs:
+                st.subheader(f"🖼️ {name}")
+                annotated, results = detect_damage(image)
 
-            if results:
-                df = pd.DataFrame(results)
-                st.dataframe(df)
+                # Add positional estimates to the results
                 for r in results:
-                    r["source"] = name
-                all_results.extend(results)
-            else:
-                st.info("✅ No defects detected in this input.")
+                    position_cm = estimate_position_cm(r["center"], frame_index=0, fps=30)  # Single image, so frame_index=0
+                    r["position_cm"] = position_cm
 
-        st.session_state.results = all_results
+                st.image(annotated[:, :, ::-1], caption="Detected Image", use_column_width=True)
+
+                if results:
+                    df = pd.DataFrame(results)
+                    st.dataframe(df)
+                    for r in results:
+                        r["source"] = name
+                    all_results.extend(results)
+                else:
+                    st.info("✅ No defects detected in this input.")
+
+            st.session_state.results = all_results
 
 # ----------------------------------------------------------
 # 📊 TAB 3 - ANALYTICS
@@ -129,5 +171,9 @@ with tab4:
         df = pd.DataFrame(st.session_state.results)
         csv = df.to_csv(index=False).encode("utf-8")
         st.download_button("📥 Download CSV", csv, "defect_results.csv", "text/csv")
+
+        if st.session_state.inputs and st.session_state.inputs[0][0] == "video":
+            with open(st.session_state.inputs[0][1], "rb") as f:
+                st.download_button("🎞️ Download Annotated Video", f.read(), "annotated_video.mp4", "video/mp4")
 
         st.success("✅ Results ready to export.")
